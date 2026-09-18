@@ -1,0 +1,13 @@
+{
+  "name": "ementas-e-compras",
+  "version": "1.0.0",
+  "description": "App local de planeamento de refeições, livro de receitas e lista de compras",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
