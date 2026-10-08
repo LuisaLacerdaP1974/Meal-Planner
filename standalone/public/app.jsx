@@ -1,4 +1,4 @@
-const { useState, useEffect, useMemo, Fragment } = React;
+const { useState, useEffect, useMemo, useRef, Fragment } = React;
 
 
 // ---------- constantes ----------
@@ -56,6 +56,22 @@ const guessCategory = (name) => {
 };
 const shareWhatsApp = (text) => window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank"); // mantida por compatibilidade, mas os botões usam agora links <a> diretos
 
+// ---------- normalização de ingredientes (nome + unidade) para a lista de compras ----------
+const WEIGHT_UNITS = { g: 1, gr: 1, grama: 1, gramas: 1, kg: 1000, quilo: 1000, quilos: 1000 };
+const VOLUME_UNITS = { ml: 1, mililitro: 1, mililitros: 1, l: 1000, litro: 1000, litros: 1000 };
+const stripAccents = (s) => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+const normalizeIngredientKey = (name) => {
+  let n = stripAccents(normalize(name));
+  if (n.endsWith("s") && n.length > 3) n = n.slice(0, -1); // de-pluralização simples
+  return n;
+};
+const unitGroup = (unit) => {
+  const u = stripAccents(normalize(unit));
+  if (WEIGHT_UNITS[u] !== undefined) return { group: "weight", factor: WEIGHT_UNITS[u] };
+  if (VOLUME_UNITS[u] !== undefined) return { group: "volume", factor: VOLUME_UNITS[u] };
+  return { group: "unit:" + u, factor: 1 };
+};
+
 // ---------- chamada à API para pesquisa de receitas ----------
 async function searchRecipeOnline(dishName) {
   const response = await fetch("/api/search-recipe", {
@@ -102,7 +118,9 @@ function IngredientEditor({ ingredients, onChange }) {
 }
 
 function App() {
-  const [plan, setPlan] = useState({ startDate: "", endDate: "", days: [] });
+  const [allDays, setAllDays] = useState({});
+  const [range, setRange] = useState({ startDate: "", endDate: "" });
+  const [singleDay, setSingleDay] = useState(false);
   const [dishes, setDishes] = useState({});
   const [recipes, setRecipes] = useState({});
   const [checked, setChecked] = useState({});
@@ -116,33 +134,70 @@ function App() {
   const [expandedRecipes, setExpandedRecipes] = useState({});
   const [editingRecipeId, setEditingRecipeId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
+  const [userCode, setUserCode] = useState(() => { try { return window.localStorage.getItem("userCode") || ""; } catch (e) { return ""; } });
+  const [codeInput, setCodeInput] = useState("");
+  const syncTimer = useRef(null);
 
-  // ---------- carregar dados persistidos ----------
+  // ---------- carregar dados persistidos (código pessoal > servidor; senão localStorage) ----------
   useEffect(() => {
     (async () => {
-      try { const r = await window.storage.get("plan"); if (r) { const p = JSON.parse(r.value); setPlan(p); setDraftStart(p.startDate || ""); setDraftEnd(p.endDate || ""); } } catch (e) {}
-      try { const r = await window.storage.get("dishes"); if (r) setDishes(JSON.parse(r.value)); } catch (e) {}
-      try { const r = await window.storage.get("recipes"); if (r) setRecipes(JSON.parse(r.value)); } catch (e) {}
-      try { const r = await window.storage.get("checked"); if (r) setChecked(JSON.parse(r.value)); } catch (e) {}
+      let serverData = null;
+      if (userCode) {
+        try {
+          const res = await fetch(`/api/data/${encodeURIComponent(userCode)}`);
+          if (res.ok) { const j = await res.json(); serverData = j.data; }
+        } catch (e) {}
+      }
+      if (serverData) {
+        setAllDays(serverData.allDays || {});
+        setDishes(serverData.dishes || {});
+        setRecipes(serverData.recipes || {});
+        setChecked(serverData.checked || {});
+        const rg = serverData.range || { startDate: "", endDate: "" };
+        setRange(rg); setDraftStart(rg.startDate || ""); setDraftEnd(rg.endDate || "");
+      } else {
+        try { const r = await window.storage.get("allDays"); if (r) setAllDays(JSON.parse(r.value)); } catch (e) {}
+        try { const r = await window.storage.get("dishes"); if (r) setDishes(JSON.parse(r.value)); } catch (e) {}
+        try { const r = await window.storage.get("recipes"); if (r) setRecipes(JSON.parse(r.value)); } catch (e) {}
+        try { const r = await window.storage.get("checked"); if (r) setChecked(JSON.parse(r.value)); } catch (e) {}
+        try { const r = await window.storage.get("range"); if (r) { const rg = JSON.parse(r.value); setRange(rg); setDraftStart(rg.startDate || ""); setDraftEnd(rg.endDate || ""); } } catch (e) {}
+      }
       setLoaded(true);
     })();
   }, []);
 
-  useEffect(() => { if (loaded) window.storage.set("plan", JSON.stringify(plan), false).catch(() => {}); }, [plan, loaded]);
+  useEffect(() => { if (loaded) window.storage.set("allDays", JSON.stringify(allDays), false).catch(() => {}); }, [allDays, loaded]);
   useEffect(() => { if (loaded) window.storage.set("dishes", JSON.stringify(dishes), false).catch(() => {}); }, [dishes, loaded]);
   useEffect(() => { if (loaded) window.storage.set("recipes", JSON.stringify(recipes), false).catch(() => {}); }, [recipes, loaded]);
   useEffect(() => { if (loaded) window.storage.set("checked", JSON.stringify(checked), false).catch(() => {}); }, [checked, loaded]);
+  useEffect(() => { if (loaded) window.storage.set("range", JSON.stringify(range), false).catch(() => {}); }, [range, loaded]);
+
+  // ---------- sincronização com o servidor (código pessoal), com atraso para não sobrecarregar ----------
+  useEffect(() => {
+    if (!loaded || !userCode) return;
+    if (syncTimer.current) clearTimeout(syncTimer.current);
+    syncTimer.current = setTimeout(() => {
+      fetch(`/api/data/${encodeURIComponent(userCode)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allDays, dishes, recipes, checked, range }),
+      }).catch(() => {});
+    }, 1500);
+    return () => clearTimeout(syncTimer.current);
+  }, [allDays, dishes, recipes, checked, range, loaded, userCode]);
 
   // ---------- plano ----------
-  const generateDays = () => {
-    if (!draftStart || !draftEnd || draftStart > draftEnd) return;
-    const dates = buildDateRange(draftStart, draftEnd);
-    setPlan((prev) => {
-      const byDate = {}; prev.days.forEach((d) => (byDate[d.date] = d));
-      const days = dates.map((date) => byDate[date] || { date, meals: { almoco: emptyMeal(), jantar: emptyMeal() } });
-      return { startDate: draftStart, endDate: draftEnd, days };
-    });
+  const applyRange = () => {
+    if (!draftStart) return;
+    const end = singleDay ? draftStart : (draftEnd || draftStart);
+    if (draftStart > end) return;
+    setRange({ startDate: draftStart, endDate: end });
   };
+
+  const displayedDays = useMemo(() => {
+    if (!range.startDate) return [];
+    return buildDateRange(range.startDate, range.endDate).map((date) => allDays[date] || { date, meals: { almoco: emptyMeal(), jantar: emptyMeal() } });
+  }, [range, allDays]);
 
   const upsertDish = (name, category) => {
     const key = normalize(name);
@@ -151,23 +206,20 @@ function App() {
   };
 
   const patchSlot = (dateISO, mealType, slotKey, patch) => {
-    setPlan((p) => ({
-      ...p,
-      days: p.days.map((d) => {
-        if (d.date !== dateISO) return d;
-        const meal = { ...d.meals[mealType] };
-        if (slotKey === "sopa" || slotKey === "principal" || slotKey === "acompanhamento") {
-          meal[slotKey] = { ...meal[slotKey], ...patch };
-        } else {
-          meal.extras = (meal.extras || []).map((ex) => (ex.id === slotKey ? { ...ex, ...patch } : ex));
-        }
-        return { ...d, meals: { ...d.meals, [mealType]: meal } };
-      }),
-    }));
+    setAllDays((all) => {
+      const day = all[dateISO] || { date: dateISO, meals: { almoco: emptyMeal(), jantar: emptyMeal() } };
+      const meal = { ...day.meals[mealType] };
+      if (slotKey === "sopa" || slotKey === "principal" || slotKey === "acompanhamento") {
+        meal[slotKey] = { ...meal[slotKey], ...patch };
+      } else {
+        meal.extras = (meal.extras || []).map((ex) => (ex.id === slotKey ? { ...ex, ...patch } : ex));
+      }
+      return { ...all, [dateISO]: { ...day, meals: { ...day.meals, [mealType]: meal } } };
+    });
   };
 
   const findSlot = (dateISO, mealType, slotKey) => {
-    const day = plan.days.find((d) => d.date === dateISO);
+    const day = allDays[dateISO];
     if (!day) return null;
     if (slotKey === "sopa" || slotKey === "principal" || slotKey === "acompanhamento") return day.meals[mealType][slotKey];
     return (day.meals[mealType].extras || []).find((e) => e.id === slotKey) || null;
@@ -196,27 +248,22 @@ function App() {
   const unlinkSlot = (dateISO, mealType, slotKey) => patchSlot(dateISO, mealType, slotKey, { recipeId: null });
 
   const addExtraDish = (dateISO, mealType) => {
-    setPlan((p) => ({
-      ...p,
-      days: p.days.map((d) => {
-        if (d.date !== dateISO) return d;
-        const meal = { ...d.meals[mealType] };
-        meal.extras = [...(meal.extras || []), { id: uid(), name: "", category: null, recipeId: null }];
-        return { ...d, meals: { ...d.meals, [mealType]: meal } };
-      }),
-    }));
+    setAllDays((all) => {
+      const day = all[dateISO] || { date: dateISO, meals: { almoco: emptyMeal(), jantar: emptyMeal() } };
+      const meal = { ...day.meals[mealType] };
+      meal.extras = [...(meal.extras || []), { id: uid(), name: "", category: null, recipeId: null }];
+      return { ...all, [dateISO]: { ...day, meals: { ...day.meals, [mealType]: meal } } };
+    });
   };
 
   const removeExtraDish = (dateISO, mealType, id) => {
-    setPlan((p) => ({
-      ...p,
-      days: p.days.map((d) => {
-        if (d.date !== dateISO) return d;
-        const meal = { ...d.meals[mealType] };
-        meal.extras = (meal.extras || []).filter((e) => e.id !== id);
-        return { ...d, meals: { ...d.meals, [mealType]: meal } };
-      }),
-    }));
+    setAllDays((all) => {
+      const day = all[dateISO];
+      if (!day) return all;
+      const meal = { ...day.meals[mealType] };
+      meal.extras = (meal.extras || []).filter((e) => e.id !== id);
+      return { ...all, [dateISO]: { ...day, meals: { ...day.meals, [mealType]: meal } } };
+    });
   };
 
   // ---------- pesquisa de receitas ----------
@@ -297,10 +344,10 @@ function App() {
 
   const toggleExpandSlot = (key) => setExpandedSlots((s) => ({ ...s, [key]: !s[key] }));
 
-  // ---------- lista de compras ----------
+  // ---------- lista de compras (com normalização de nome/unidade, sem duplicados) ----------
   const shoppingList = useMemo(() => {
     const map = {};
-    plan.days.forEach((day) => {
+    displayedDays.forEach((day) => {
       ["almoco", "jantar"].forEach((mealType) => {
         const meal = day.meals[mealType];
         const slots = [meal.sopa, meal.principal, meal.acompanhamento, ...(meal.extras || [])];
@@ -309,40 +356,51 @@ function App() {
           const recipe = recipes[slot.recipeId];
           if (!recipe) return;
           recipe.ingredients.forEach((ing) => {
-            const unit = (ing.unit || "").trim();
-            const key = normalize(ing.name) + "|" + normalize(unit);
-            if (!map[key]) map[key] = { key, name: ing.name, unit, numeric: 0, hasNumeric: false, texts: [] };
+            const nameKey = normalizeIngredientKey(ing.name);
+            const { group, factor } = unitGroup(ing.unit);
+            const key = nameKey + "|" + group;
+            if (!map[key]) {
+              const displayUnit = group === "weight" ? "g" : group === "volume" ? "ml" : (ing.unit || "").trim();
+              map[key] = { key, name: ing.name, group, displayUnit, baseAmount: 0, hasNumeric: false, texts: [] };
+            }
             const qtyStr = String(ing.quantity ?? "").trim();
             const num = parseFloat(qtyStr.replace(",", "."));
-            if (!isNaN(num) && /^[\d.,\s]+$/.test(qtyStr)) { map[key].numeric += num; map[key].hasNumeric = true; }
+            if (!isNaN(num) && /^[\d.,\s]+$/.test(qtyStr)) { map[key].baseAmount += num * factor; map[key].hasNumeric = true; }
             else if (qtyStr && !map[key].texts.includes(qtyStr)) map[key].texts.push(qtyStr);
           });
         });
       });
     });
     return Object.values(map).sort((a, b) => a.name.localeCompare(b.name, "pt"));
-  }, [plan, recipes]);
+  }, [displayedDays, recipes]);
 
   const displayQty = (item) => {
     const parts = [];
-    if (item.hasNumeric) { const n = Number.isInteger(item.numeric) ? item.numeric : Math.round(item.numeric * 100) / 100; parts.push(`${n}${item.unit ? " " + item.unit : ""}`); }
+    if (item.hasNumeric) {
+      let amount = item.baseAmount;
+      let unitLabel = item.displayUnit;
+      if (item.group === "weight") { if (amount >= 1000) { amount = amount / 1000; unitLabel = "kg"; } else { unitLabel = "g"; } }
+      else if (item.group === "volume") { if (amount >= 1000) { amount = amount / 1000; unitLabel = "l"; } else { unitLabel = "ml"; } }
+      const rounded = Number.isInteger(amount) ? amount : Math.round(amount * 100) / 100;
+      parts.push(`${rounded}${unitLabel ? " " + unitLabel : ""}`);
+    }
     if (item.texts.length) parts.push(item.texts.join(", "));
     return parts.join(" + ") || "q.b.";
   };
 
   const buildShoppingShareText = () => {
-    const range = plan.startDate ? ` (${formatShort(plan.startDate)} a ${formatShort(plan.endDate)})` : "";
+    const rangeLabel = range.startDate ? ` (${formatShort(range.startDate)} a ${formatShort(range.endDate)})` : "";
     const lines = shoppingList.map((i) => `- ${i.name}: ${displayQty(i)}`);
-    return `🛒 Lista de compras${range}\n\n${lines.join("\n")}`;
+    return `🛒 Lista de compras${rangeLabel}\n\n${lines.join("\n")}`;
   };
 
   const buildPlanShareText = () => {
-    const range = plan.startDate ? ` (${formatShort(plan.startDate)} a ${formatShort(plan.endDate)})` : "";
+    const rangeLabel = range.startDate ? ` (${formatShort(range.startDate)} a ${formatShort(range.endDate)})` : "";
     const fmt = (m) => [m.sopa.name, m.principal.name, m.acompanhamento.name, ...(m.extras || []).map((e) => e.name)].filter(Boolean).join(" | ") || "—";
-    const dayLines = plan.days.map((day) => `${formatDatePT(day.date)}\nAlmoço: ${fmt(day.meals.almoco)}\nJantar: ${fmt(day.meals.jantar)}`);
+    const dayLines = displayedDays.map((day) => `${formatDatePT(day.date)}\nAlmoço: ${fmt(day.meals.almoco)}\nJantar: ${fmt(day.meals.jantar)}`);
 
     const usedIds = new Set();
-    plan.days.forEach((day) => {
+    displayedDays.forEach((day) => {
       ["almoco", "jantar"].forEach((mealType) => {
         const meal = day.meals[mealType];
         [meal.sopa, meal.principal, meal.acompanhamento, ...(meal.extras || [])].forEach((slot) => {
@@ -353,12 +411,22 @@ function App() {
     const usedRecipes = Array.from(usedIds).map((id) => recipes[id]).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name, "pt"));
     const recipesBlock = usedRecipes.length ? `\n\n———\n📖 Receitas do período\n\n${usedRecipes.map((r) => buildRecipeShareText(r)).join("\n\n")}` : "";
 
-    return `📅 Plano de refeições${range}\n\n${dayLines.join("\n\n")}${recipesBlock}`;
+    return `📅 Plano de refeições${rangeLabel}\n\n${dayLines.join("\n\n")}${recipesBlock}`;
   };
 
   const buildRecipeShareText = (recipe) => {
     const lines = recipe.ingredients.map((i) => `- ${i.name}${i.quantity ? `: ${i.quantity}${i.unit ? " " + i.unit : ""}` : ""}`);
     return `🍲 ${recipe.name}\n\nIngredientes:\n${lines.join("\n")}${recipe.prep ? `\n\nPreparação: ${recipe.prep}` : ""}${recipe.sourceUrl ? `\n\nFonte: ${recipe.sourceUrl}` : ""}`;
+  };
+
+  const buildRecipeBookShareText = (onlyCategory) => {
+    const cats = onlyCategory ? [onlyCategory] : CATEGORY_ORDER;
+    const blocks = cats.map((c) => {
+      const list = recipesByCategory[c];
+      if (!list || !list.length) return null;
+      return `— ${CATEGORY_META[c].label} —\n\n${list.map((r) => buildRecipeShareText(r)).join("\n\n")}`;
+    }).filter(Boolean);
+    return `📖 Livro de receitas\n\n${blocks.join("\n\n")}`;
   };
 
   // ---------- livro de receitas ----------
@@ -386,6 +454,20 @@ function App() {
   };
 
   const allDishNames = useMemo(() => Object.values(dishes).map((d) => d.name), [dishes]);
+
+  const handlePickExistingRecipe = (dateISO, mealType, slotKey, recipeId) => {
+    if (!recipeId) return;
+    const r = recipes[recipeId];
+    if (!r) return;
+    linkRecipeToSlot(dateISO, mealType, slotKey, r.id, r.category, r.name);
+  };
+
+  const pickerCategoriesFor = (kind) => {
+    if (kind === "sopa") return ["sopa"];
+    if (kind === "acomp") return ["acomp"];
+    if (kind === "principal") return ["carne", "peixe", "massa", "arroz"];
+    return CATEGORY_ORDER;
+  };
 
   // ---------- render de um campo de refeição ----------
   const renderSlot = (dateISO, mealType, slotKey, slot, placeholder, kind) => {
@@ -420,6 +502,21 @@ function App() {
             <button className="icon-btn danger" onClick={() => removeExtraDish(dateISO, mealType, slotKey)} aria-label="Remover prato">🗑️</button>
           )}
         </div>
+
+        {!linkedRecipe && pickerCategoriesFor(kind).some((c) => (recipesByCategory[c] || []).length > 0) && (
+          <select
+            className="recipe-picker"
+            value=""
+            onChange={(e) => handlePickExistingRecipe(dateISO, mealType, slotKey, e.target.value)}
+          >
+            <option value="">📖 Escolher receita já existente…</option>
+            {pickerCategoriesFor(kind).map((c) => (recipesByCategory[c] || []).length > 0 && (
+              <optgroup key={c} label={CATEGORY_META[c].label}>
+                {recipesByCategory[c].map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        )}
 
         {!linkedRecipe && !st && slot.name.trim() && (
           <button className="text-btn" onClick={() => openManualEntry(dateISO, mealType, slotKey, slot.name)}>➕ Adicionar ingredientes à mão</button>
@@ -479,6 +576,37 @@ function App() {
       </div>
     );
   };
+
+  if (!userCode) {
+    return (
+      <div className="app">
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+          :root { --paper: #EEF0E6; --card: #FFFFFF; --border: #D8D6C6; --ink: #262622; --ink-soft: #6B6A5F; --accent: #3F6355; --accent-dark: #2E4A40; }
+          * { box-sizing: border-box; }
+          .app { font-family: 'IBM Plex Sans', sans-serif; background: var(--paper); color: var(--ink); min-height: 100vh; padding: 14px 12px 40px; max-width: 480px; margin: 0 auto; }
+          h1 { font-family: 'Fraunces', serif; font-size: 22px; font-weight: 600; margin: 4px 0 2px; }
+          .subtitle { font-size: 13px; color: var(--ink-soft); margin: 0 0 14px; }
+          .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+          .card p { margin-top: 0; font-size: 13.5px; }
+          input { width: 100%; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px; background: #FBFAF6; color: var(--ink); margin-bottom: 10px; }
+          button { width: 100%; background: var(--accent); color: #fff; border: none; border-radius: 7px; padding: 10px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
+          button:disabled { opacity: 0.5; }
+        `}</style>
+        <h1>Meal Planner</h1>
+        <p className="subtitle">Para os teus dados ficarem disponíveis em qualquer aparelho (telemóvel, tablet, PC), usa um código pessoal — é só teu, guarda-o num sítio seguro.</p>
+        <div className="card">
+          <p>Já tens um código? Escreve-o aqui:</p>
+          <input value={codeInput} placeholder="O teu código" onChange={(e) => setCodeInput(e.target.value)} />
+          <button disabled={!codeInput.trim()} onClick={() => { try { window.localStorage.setItem("userCode", codeInput.trim().toUpperCase()); } catch (e) {} window.location.reload(); }}>Continuar com este código</button>
+        </div>
+        <div className="card">
+          <p>Ainda não tens código? Cria um novo (guarda-o bem, vais precisar dele nos outros aparelhos):</p>
+          <button onClick={() => { const c = uid().toUpperCase(); window.alert("O teu código pessoal é:\n\n" + c + "\n\nAnota-o ou tira um print — vais precisar dele para acederes aos teus dados a partir de outro aparelho."); try { window.localStorage.setItem("userCode", c); } catch (e) {} window.location.reload(); }}>Criar código novo</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -553,9 +681,14 @@ function App() {
         .recipe-name { font-family: 'Fraunces', serif; font-weight: 600; font-size: 14.5px; flex: 1; }
         .recipe-count { font-size: 12px; color: var(--ink-soft); }
         .recipe-actions { display: flex; gap: 4px; margin-top: 6px; }
+        .recipe-picker { width: 100%; margin-top: 5px; font-family: 'IBM Plex Sans', sans-serif; font-size: 12.5px; padding: 6px 8px; border: 1px dashed var(--border); border-radius: 7px; background: #FBFAF6; color: var(--accent-dark); }
+        .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-soft); margin-top: 8px; }
+        .checkbox-label input { width: auto; margin: 0; }
+        .user-code-footer { text-align: center; font-size: 11.5px; color: var(--ink-soft); margin-top: 24px; }
+        .user-code-footer a { color: var(--accent-dark); }
       `}</style>
 
-      <h1>Ementas &amp; Compras</h1>
+      <h1>Meal Planner</h1>
       <p className="subtitle">Planeia refeições, guarda receitas e gera a lista de compras.</p>
 
       <div className="tabs">
@@ -574,20 +707,23 @@ function App() {
           <div className="card">
             <div className="period-row">
               <div className="field"><label>Início</label><input type="date" value={draftStart} onChange={(e) => setDraftStart(e.target.value)} /></div>
-              <div className="field"><label>Fim</label><input type="date" value={draftEnd} onChange={(e) => setDraftEnd(e.target.value)} /></div>
-              <button className="btn-primary" disabled={!draftStart || !draftEnd} onClick={generateDays}>Gerar</button>
+              {!singleDay && <div className="field"><label>Fim</label><input type="date" value={draftEnd} onChange={(e) => setDraftEnd(e.target.value)} /></div>}
+              <button className="btn-primary" disabled={!draftStart || (!singleDay && !draftEnd)} onClick={applyRange}>Ver</button>
             </div>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={singleDay} onChange={(e) => setSingleDay(e.target.checked)} /> Só este dia
+            </label>
           </div>
 
-          {plan.days.length === 0 && <div className="empty-state">Escolhe um período acima e carrega em "Gerar" para começar.</div>}
+          {displayedDays.length === 0 && <div className="empty-state">Escolhe uma data (ou período) acima e carrega em "Ver" — todos os dias que já planeaste ficam guardados, por isso podes voltar a qualquer data anterior.</div>}
 
-          {plan.days.length > 0 && (
+          {displayedDays.length > 0 && (
             <div className="share-row">
               <a className="wa-btn" href={`https://wa.me/?text=${encodeURIComponent(buildPlanShareText())}`} target="_blank" rel="noopener noreferrer">💬 Partilhar plano</a>
             </div>
           )}
 
-          {plan.days.map((day) => (
+          {displayedDays.map((day) => (
             <div className="day-card card" key={day.date}>
               <p className="day-title">{formatDatePT(day.date)}</p>
               <div className="meal-block">
@@ -642,9 +778,19 @@ function App() {
           <div className="card">
             <input className="filter-input" style={{ width: "100%" }} placeholder="Pesquisar receitas guardadas…" value={recipeFilter} onChange={(e) => setRecipeFilter(e.target.value)} />
           </div>
+          {Object.keys(recipes).length > 0 && (
+            <div className="share-row">
+              <a className="wa-btn" href={`https://wa.me/?text=${encodeURIComponent(buildRecipeBookShareText())}`} target="_blank" rel="noopener noreferrer">💬 Partilhar livro completo</a>
+            </div>
+          )}
           {CATEGORY_ORDER.map((cat) => (
             <div className="cat-section" key={cat}>
-              <div className="cat-header"><span className="cat-dot" style={{ background: CATEGORY_META[cat].color }} />{CATEGORY_META[cat].label} <span className="recipe-count">({recipesByCategory[cat].length})</span></div>
+              <div className="cat-header">
+                <span className="cat-dot" style={{ background: CATEGORY_META[cat].color }} />{CATEGORY_META[cat].label} <span className="recipe-count">({recipesByCategory[cat].length})</span>
+                {recipesByCategory[cat].length > 0 && (
+                  <a className="icon-btn ghost" style={{ marginLeft: "auto" }} href={`https://wa.me/?text=${encodeURIComponent(buildRecipeBookShareText(cat))}`} target="_blank" rel="noopener noreferrer" aria-label="Partilhar categoria">💬</a>
+                )}
+              </div>
               {recipesByCategory[cat].length === 0 && <p className="subtitle" style={{ margin: "0 0 8px" }}>Sem receitas guardadas ainda.</p>}
               {recipesByCategory[cat].map((r) => (
                 <div className="recipe-card" key={r.id}>
@@ -689,6 +835,11 @@ function App() {
           ))}
         </div>
       )}
+
+      <p className="user-code-footer">
+        Código: <strong>{userCode}</strong> ·{" "}
+        <a href="#" onClick={(e) => { e.preventDefault(); if (window.confirm("Mudar de código? Vais deixar de ver os dados deste código neste aparelho (podes voltar a introduzi-lo mais tarde).")) { try { window.localStorage.removeItem("userCode"); } catch (err) {} window.location.reload(); } }}>mudar código</a>
+      </p>
     </div>
   );
 }
