@@ -57,6 +57,19 @@ Calcula as quantidades para 4 pessoas. Usa nomes de ingredientes correntes em po
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`\nApp a correr! Abre no browser: http://localhost:${PORT}\n`);
-});
+// ---------- sincronização entre dispositivos (código pessoal) ----------
+// Usa o Supabase (base de dados gratuita) como armazenamento remoto, para os dados
+// ficarem disponíveis em qualquer telemóvel/tablet/PC que uses com o mesmo código.
+// Se SUPABASE_URL / SUPABASE_KEY não estiverem configurados, estes endpoints
+// respondem com "não configurado" e a app continua a funcionar apenas localmente.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+app.get("/api/data/:code", async (req, res) => {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(503).json({ error: "Sincronização entre aparelhos não configurada (ver README.md)." });
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/user_data?code=eq.${encodeURIComponent(req.params.code)}&select=data`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    });
+    if (!r.ok) { const t = await r.text(); return res.status(r.status).json({ error: t }); }
+    const rows = await r.json();
