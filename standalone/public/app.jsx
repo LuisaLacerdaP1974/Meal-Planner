@@ -156,11 +156,25 @@ function App() {
         const rg = serverData.range || { startDate: "", endDate: "" };
         setRange(rg); setDraftStart(rg.startDate || ""); setDraftEnd(rg.endDate || "");
       } else {
-        try { const r = await window.storage.get("allDays"); if (r) setAllDays(JSON.parse(r.value)); } catch (e) {}
+        // Importação automática do plano antigo (versão anterior guardava tudo numa única chave "plan")
+        let legacyPlan = null;
+        try { const r = await window.storage.get("plan"); if (r) legacyPlan = JSON.parse(r.value); } catch (e) {}
+        let hasAllDays = false;
+        try { const r = await window.storage.get("allDays"); if (r) { const parsed = JSON.parse(r.value); setAllDays(parsed); hasAllDays = Object.keys(parsed || {}).length > 0; } } catch (e) {}
+        if (!hasAllDays && legacyPlan && Array.isArray(legacyPlan.days)) {
+          const migrated = {};
+          legacyPlan.days.forEach((d) => { if (d && d.date) migrated[d.date] = d; });
+          setAllDays(migrated);
+        }
         try { const r = await window.storage.get("dishes"); if (r) setDishes(JSON.parse(r.value)); } catch (e) {}
         try { const r = await window.storage.get("recipes"); if (r) setRecipes(JSON.parse(r.value)); } catch (e) {}
         try { const r = await window.storage.get("checked"); if (r) setChecked(JSON.parse(r.value)); } catch (e) {}
-        try { const r = await window.storage.get("range"); if (r) { const rg = JSON.parse(r.value); setRange(rg); setDraftStart(rg.startDate || ""); setDraftEnd(rg.endDate || ""); } } catch (e) {}
+        let hasRange = false;
+        try { const r = await window.storage.get("range"); if (r) { const rg = JSON.parse(r.value); setRange(rg); setDraftStart(rg.startDate || ""); setDraftEnd(rg.endDate || ""); hasRange = !!rg.startDate; } } catch (e) {}
+        if (!hasRange && legacyPlan && legacyPlan.startDate) {
+          const rg = { startDate: legacyPlan.startDate, endDate: legacyPlan.endDate || legacyPlan.startDate };
+          setRange(rg); setDraftStart(rg.startDate); setDraftEnd(rg.endDate);
+        }
       }
       setLoaded(true);
     })();
