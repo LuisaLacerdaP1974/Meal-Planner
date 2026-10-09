@@ -73,3 +73,32 @@ app.get("/api/data/:code", async (req, res) => {
     });
     if (!r.ok) { const t = await r.text(); return res.status(r.status).json({ error: t }); }
     const rows = await r.json();
+    res.json({ data: (rows && rows[0] && rows[0].data) || null });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.post("/api/data/:code", async (req, res) => {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(503).json({ error: "Sincronização entre aparelhos não configurada (ver README.md)." });
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/user_data`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates",
+      },
+      body: JSON.stringify([{ code: req.params.code, data: req.body, updated_at: new Date().toISOString() }]),
+    });
+    if (!r.ok) { const t = await r.text(); return res.status(r.status).json({ error: t }); }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`\nApp a correr! Abre no browser: http://localhost:${PORT}\n`);
+});
