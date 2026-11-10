@@ -57,28 +57,180 @@ const guessCategory = (name) => {
 const shareWhatsApp = (text) => window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank"); // mantida por compatibilidade, mas os botões usam agora links <a> diretos
 
 // ---------- normalização de ingredientes (nome + unidade) para a lista de compras ----------
-const WEIGHT_UNITS = { g: 1, gr: 1, grama: 1, gramas: 1, kg: 1000, quilo: 1000, quilos: 1000 };
-const VOLUME_UNITS = { ml: 1, mililitro: 1, mililitros: 1, l: 1000, litro: 1000, litros: 1000 };
 const stripAccents = (s) => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-const normalizeIngredientKey = (name) => {
-  let n = stripAccents(normalize(name));
-  if (n.endsWith("s") && n.length > 3) n = n.slice(0, -1); // de-pluralização simples
-  return n;
+
+// Tipos de unidade: "w" = peso (convertido para g), "v" = volume (convertido para ml), "c" = contagem
+const UNIT_TABLE = {
+  g: ["w", 1], gr: ["w", 1], grama: ["w", 1], gramas: ["w", 1],
+  kg: ["w", 1000], quilo: ["w", 1000], quilos: ["w", 1000],
+  ml: ["v", 1], cl: ["v", 10], dl: ["v", 100], l: ["v", 1000], lt: ["v", 1000], litro: ["v", 1000], litros: ["v", 1000],
+  "colher de sopa": ["v", 15, true], "colheres de sopa": ["v", 15, true], "colher sopa": ["v", 15, true], "colheres sopa": ["v", 15, true], "c sopa": ["v", 15, true], csopa: ["v", 15, true], cs: ["v", 15, true],
+  "colher de cha": ["v", 5, true], "colheres de cha": ["v", 5, true], "colher cha": ["v", 5, true], "colheres cha": ["v", 5, true], "c cha": ["v", 5, true], cc: ["v", 5, true],
+  "colher de sobremesa": ["v", 10, true], "colheres de sobremesa": ["v", 10, true],
+  "colher de cafe": ["v", 2.5, true], "colheres de cafe": ["v", 2.5, true],
+  chavena: ["v", 240, true], chavenas: ["v", 240, true], copo: ["v", 200, true], copos: ["v", 200, true],
 };
-const unitGroup = (unit) => {
-  const u = stripAccents(normalize(unit));
-  if (WEIGHT_UNITS[u] !== undefined) return { group: "weight", factor: WEIGHT_UNITS[u] };
-  if (VOLUME_UNITS[u] !== undefined) return { group: "volume", factor: VOLUME_UNITS[u] };
-  return { group: "unit:" + u, factor: 1 };
+const COUNT_ALIASES = {
+  "": "un", un: "un", unid: "un", unidade: "un", unidades: "un",
+  dente: "dente", dentes: "dente", ramo: "ramo", ramos: "ramo", folha: "folha", folhas: "folha",
+  vagem: "vagem", vagens: "vagem", molho: "molho", molhos: "molho", lata: "lata", latas: "lata",
+  fatia: "fatia", fatias: "fatia", pitada: "pitada", pitadas: "pitada", pacote: "pacote", pacotes: "pacote",
+  qb: "qb", "q b": "qb",
+};
+const parseUnit = (u) => {
+  const s = stripAccents(String(u || "").toLowerCase()).replace(/\([^)]*\)/g, " ").replace(/\./g, "").replace(/\s+/g, " ").trim();
+  if (UNIT_TABLE[s]) { const [kind, factor, measure] = UNIT_TABLE[s]; return { kind, factor, measure: !!measure }; }
+  if (COUNT_ALIASES[s] !== undefined) return { kind: "c", label: COUNT_ALIASES[s] };
+  return { kind: "c", label: s };
+};
+const parseQty = (q) => {
+  const s = String(q ?? "").trim().replace(",", ".");
+  if (!s) return null;
+  let m = s.match(/^(\d+)\s+(\d+)\/(\d+)$/); if (m) return +m[1] + +m[2] / +m[3];
+  m = s.match(/^(\d+)\/(\d+)$/); if (m) return +m[1] / +m[2];
+  m = s.match(/^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)$/); if (m) return Math.max(+m[1], +m[2]);
+  if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  return null;
 };
 
-// ---------- chamada à API para pesquisa de receitas ----------
-async function searchRecipeOnline(dishName) {
-  const response = await fetch("/api/search-recipe", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dishName }),
+// Limpeza do nome: tira descritivos (fresco, picado, médio...) e junta sinónimos
+const DESCRIPTORS = /\b(fresc[oa]s?|picad[oa]s?|mo[ií]d[oa]s?|laminad[oa]s?|m[eé]di[oa]s?|grandes?|pequen[oa]s?|preta)\b/gi;
+const ING_ALIASES = [
+  [/^dentes? de alho$/, "alho"],
+  [/^folhas? de louro$/, "louro"],
+  [/^alho[- ]franc[eê]s/, "alho-francês"],
+  [/^pimenta/, "pimenta"],
+  [/^leite de c[oô]co$/, "leite de coco"],
+  [/^noz[- ]moscada$/, "noz-moscada"],
+  [/^piri[- ]?piri$/, "piri-piri"],
+  [/^org[aã]os?$/, "orégãos"],
+  [/^couve[- ]flor$/, "couve-flor"],
+  [/^colorau/, "colorau"],
+];
+const cleanName = (name) => {
+  const n = String(name || "").toLowerCase().replace(/\([^)]*\)/g, " ").replace(DESCRIPTORS, " ").replace(/\s+/g, " ").trim();
+  for (const [re, to] of ING_ALIASES) if (re.test(n)) return to;
+  return n;
+};
+const plainName = (display) => stripAccents(display).replace(/-/g, " ");
+const ingKey = (display) => { let n = plainName(display); if (n.length > 3 && n.endsWith("s") && !/(frances|ss)$/.test(n)) n = n.slice(0, -1); return n; };
+
+// Estimativas usadas só quando é preciso juntar unidades diferentes
+const DENSITY = { manteiga: 1, margarina: 1, acucar: 0.85, farinha: 0.55, "queijo ralado": 0.4, natas: 1 };
+const dens = (key) => DENSITY[key] ?? DENSITY[key.split(" ")[0]] ?? 1;
+// Colheres só são convertidas em gramas nestes ingredientes; nos outros (ervas, especiarias...) ficam em colheres
+const CONVERT_SPOON_RE = /^(manteiga|margarina|queijo|natas|acucar)/;
+// Em alguns ingredientes, "unidade" quer dizer outra coisa
+const UNIT_OVERRIDE = { alho: { un: "dente" }, louro: { un: "folha" } };
+const AVG_WEIGHT_G = { cebola: 150, cenoura: 100, batata: 150, "alho frances": 150, tomate: 120, "couve flor": 800, chuchu: 300, malagueta: 10, limao: 100, pimento: 150, "pimento verde": 150, "pimento vermelho": 150 };
+const avgWeight = (key, label) => {
+  if (label === "dente" && key === "alho") return 5;
+  if (label === "un") return AVG_WEIGHT_G[key] || null;
+  return null;
+};
+const LIQUID_RE = /^(agua|azeite|oleo|leite|caldo|vinho|sumo|molho de soja|polpa de tomate|vinagre|cerveja|natas)\b/;
+
+const trimNum = (n) => String(Math.round(n * 100) / 100).replace(".", ",");
+const roundApprox = (n) => { const step = n < 100 ? 5 : n < 1000 ? 10 : 100; return Math.round(n / step) * step || n; };
+const fmtAmount = (n, unit, approx) => {
+  const v = approx ? roundApprox(n) : n;
+  const prefix = approx ? "~" : "";
+  if (v >= 1000) return `${prefix}${trimNum(v / 1000)} ${unit === "g" ? "kg" : "l"}`;
+  return `${prefix}${trimNum(v)} ${unit}`;
+};
+const fmtSpoons = (ml) => {
+  const sopa = ml / 15;
+  if (Number.isInteger(sopa * 2)) return `${trimNum(sopa)} ${sopa === 1 ? "colher" : "colheres"} de sopa`;
+  const cha = ml / 5;
+  return `${trimNum(cha)} ${cha === 1 ? "colher" : "colheres"} de chá`;
+};
+const COUNT_PLURAL = { un: "un", dente: "dentes", ramo: "ramos", folha: "folhas", vagem: "vagens", molho: "molhos", lata: "latas", fatia: "fatias", pitada: "pitadas", pacote: "pacotes" };
+const fmtCount = (n, label) => {
+  const num = trimNum(n);
+  if (label === "un") return `${num} un`;
+  if (COUNT_PLURAL[label]) return `${num} ${n === 1 ? label : COUNT_PLURAL[label]}`;
+  return label ? `${num} ${label}` : num;
+};
+
+const SECTION_ORDER = ["Legumes e ervas", "Carne e peixe", "Laticínios, massas e arroz", "Líquidos e conservas", "Outros e temperos"];
+const mkRe = (terms) => new RegExp("\\b(" + terms.join("|") + ")s?\\b");
+const CATEGORY_RULES = [
+  ["Líquidos e conservas", mkRe(["agua", "azeite", "oleo", "vinho", "vinagre", "sumo", "caldo", "polpa", "molho de soja", "massa de pimentao", "leite de coco", "feijao", "grao", "cerveja"])],
+  ["Outros e temperos", mkRe(["provence", "oregao", "colorau", "paprica", "sal", "flor de sal", "pimenta", "noz moscada", "piri piri", "canela", "cominho", "caril", "acafrao"])],
+  ["Carne e peixe", mkRe(["carne", "vaca", "porco", "lombinho", "cachaco", "frango", "pato", "bacon", "peixe", "bacalhau", "salmao", "atum", "pescada", "camarao", "lula", "polvo", "chourico", "presunto", "salsicha", "peru", "borrego", "coelho", "febra", "bife", "costeleta", "entrecosto", "fiambre", "marisco", "dourada", "robalo", "sardinha"])],
+  ["Laticínios, massas e arroz", mkRe(["leite", "manteiga", "margarina", "queijo", "mozzarella", "bechamel", "natas", "iogurte", "ovo", "massa", "lasanha", "esparguete", "macarrao", "arroz", "pao"])],
+  ["Legumes e ervas", mkRe(["alho", "cebola", "cenoura", "batata", "tomate", "pimento", "couve", "chuchu", "espinafre", "cogumelo", "malagueta", "gengibre", "coentro", "alecrim", "erva", "louro", "salsa", "hortela", "manjericao", "alface", "curgete", "abobora", "brocolo", "ervilha", "nabo", "beterraba", "limao", "laranja", "maca", "banana", "aipo", "funcho", "rucula", "agriao", "pepino", "espargo"])],
+];
+const categorizeIngredient = (display) => {
+  const plain = plainName(display);
+  for (const [section, re] of CATEGORY_RULES) if (re.test(plain)) return section;
+  return "Outros e temperos";
+};
+const capitalize = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// Junta todos os ingredientes: um só item por ingrediente, com unidades convertidas e somadas
+function buildShoppingSections(rawIngredients) {
+  const map = {};
+  rawIngredients.forEach((ing) => {
+    const display = cleanName(ing.name);
+    if (!display) return;
+    const key = ingKey(display);
+    if (!map[key]) map[key] = { key, name: display, w: 0, v: 0, counts: {}, texts: [] };
+    const m = map[key];
+    if (display.length < m.name.length) m.name = display; // prefere a forma mais curta (singular)
+    const unit = parseUnit(ing.unit);
+    const qtyStr = String(ing.quantity ?? "").trim();
+    const qty = parseQty(qtyStr);
+    if (qty === null) {
+      const isQb = !qtyStr || /^q\.?\s?b\.?$/i.test(qtyStr) || (unit.kind === "c" && unit.label === "qb");
+      if (!isQb) { const t = `${qtyStr} ${String(ing.unit || "").trim()}`.trim(); if (!m.texts.includes(t)) m.texts.push(t); }
+      return;
+    }
+    if (unit.kind === "w") m.w += qty * unit.factor;
+    else if (unit.kind === "v") { m.v += qty * unit.factor; if (unit.measure) m.vMeasure = true; }
+    else if (unit.label === "qb") { /* q.b. não conta */ }
+    else {
+      let label = unit.label || "un";
+      if (UNIT_OVERRIDE[key] && UNIT_OVERRIDE[key][label]) label = UNIT_OVERRIDE[key][label];
+      m.counts[label] = (m.counts[label] || 0) + qty;
+    }
   });
+
+  const sections = {};
+  Object.values(map).forEach((m) => {
+    const plain = plainName(m.name);
+    const liquid = LIQUID_RE.test(plain);
+    const rest = { ...m.counts };
+    let amount = null, unit = null, approx = false;
+    if (liquid) {
+      if (m.w > 0 || m.v > 0) { amount = m.v + m.w; unit = "ml"; if (m.w > 0) approx = true; }
+    } else if (m.w > 0 || m.v > 0) {
+      let g = m.w;
+      let volumeText = null;
+      if (m.v > 0) {
+        if (m.w > 0 || CONVERT_SPOON_RE.test(m.key) || !m.vMeasure) { g += m.v * dens(m.key); approx = approx || m.vMeasure || m.w > 0; }
+        else volumeText = fmtSpoons(m.v);
+      }
+      Object.keys(rest).forEach((label) => { const aw = avgWeight(m.key, label); if (aw && (g > 0 || volumeText === null)) { g += rest[label] * aw; approx = true; delete rest[label]; } });
+      if (g > 0) { amount = g; unit = "g"; }
+      if (volumeText) m.texts.unshift(volumeText);
+    }
+    const parts = [];
+    if (amount !== null) parts.push(fmtAmount(amount, unit, approx));
+    Object.entries(rest).forEach(([label, n]) => parts.push(fmtCount(n, label)));
+    m.texts.forEach((t) => parts.push(t));
+    const qty = parts.length ? parts.join(" + ") : "q.b.";
+    const section = categorizeIngredient(m.name);
+    (sections[section] = sections[section] || []).push({ key: m.key, name: capitalize(m.name), qty });
+  });
+  return SECTION_ORDER.filter((s) => sections[s]).map((s) => ({
+    title: s,
+    items: sections[s].sort((a, b) => a.name.localeCompare(b.name, "pt")),
+  }));
+}
+
+// ---------- chamadas à API ----------
+async function readJsonFromApi(response) {
   if (!response.ok) {
     let bodyText = "";
     try { bodyText = await response.text(); } catch (e) {}
@@ -95,6 +247,47 @@ async function searchRecipeOnline(dishName) {
   } catch (e) {
     throw new Error(`JSON inválido: ${jsonStr.slice(0, 300)}`);
   }
+}
+
+async function searchRecipeOnline(dishName) {
+  const response = await fetch("/api/search-recipe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dishName }),
+  });
+  return readJsonFromApi(response);
+}
+
+// Reduz a fotografia (máx. 1600 px) para o envio ser rápido, mesmo com rede fraca
+const fileToResizedBase64 = (file, maxSide = 1600, quality = 0.85) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onerror = () => reject(new Error("Não consegui ler a fotografia."));
+  reader.onload = () => {
+    const img = new Image();
+    img.onerror = () => reject(new Error("Não consegui abrir a fotografia (formato não suportado?)."));
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve({ media_type: "image/jpeg", data: canvas.toDataURL("image/jpeg", quality).split(",")[1] });
+    };
+    img.src = reader.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+async function parseRecipePhotos(files) {
+  const images = await Promise.all(files.map((f) => fileToResizedBase64(f)));
+  const response = await fetch("/api/parse-recipe-photo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ images }),
+  });
+  if (response.status === 404) throw new Error("O servidor ainda não está preparado para ler fotografias (falta atualizar o server.js).");
+  if (response.status === 413) throw new Error("A fotografia é demasiado grande para o servidor. Tenta com menos fotos.");
+  return readJsonFromApi(response);
 }
 
 // ---------- editor de ingredientes reutilizável ----------
@@ -358,9 +551,9 @@ function App() {
 
   const toggleExpandSlot = (key) => setExpandedSlots((s) => ({ ...s, [key]: !s[key] }));
 
-  // ---------- lista de compras (com normalização de nome/unidade, sem duplicados) ----------
-  const shoppingList = useMemo(() => {
-    const map = {};
+  // ---------- lista de compras (um só item por ingrediente, unidades convertidas) ----------
+  const shoppingSections = useMemo(() => {
+    const all = [];
     displayedDays.forEach((day) => {
       ["almoco", "jantar"].forEach((mealType) => {
         const meal = day.meals[mealType];
@@ -369,43 +562,47 @@ function App() {
           if (!slot || !slot.recipeId) return;
           const recipe = recipes[slot.recipeId];
           if (!recipe) return;
-          recipe.ingredients.forEach((ing) => {
-            const nameKey = normalizeIngredientKey(ing.name);
-            const { group, factor } = unitGroup(ing.unit);
-            const key = nameKey + "|" + group;
-            if (!map[key]) {
-              const displayUnit = group === "weight" ? "g" : group === "volume" ? "ml" : (ing.unit || "").trim();
-              map[key] = { key, name: ing.name, group, displayUnit, baseAmount: 0, hasNumeric: false, texts: [] };
-            }
-            const qtyStr = String(ing.quantity ?? "").trim();
-            const num = parseFloat(qtyStr.replace(",", "."));
-            if (!isNaN(num) && /^[\d.,\s]+$/.test(qtyStr)) { map[key].baseAmount += num * factor; map[key].hasNumeric = true; }
-            else if (qtyStr && !map[key].texts.includes(qtyStr)) map[key].texts.push(qtyStr);
-          });
+          recipe.ingredients.forEach((ing) => all.push(ing));
         });
       });
     });
-    return Object.values(map).sort((a, b) => a.name.localeCompare(b.name, "pt"));
+    return buildShoppingSections(all);
   }, [displayedDays, recipes]);
 
-  const displayQty = (item) => {
-    const parts = [];
-    if (item.hasNumeric) {
-      let amount = item.baseAmount;
-      let unitLabel = item.displayUnit;
-      if (item.group === "weight") { if (amount >= 1000) { amount = amount / 1000; unitLabel = "kg"; } else { unitLabel = "g"; } }
-      else if (item.group === "volume") { if (amount >= 1000) { amount = amount / 1000; unitLabel = "l"; } else { unitLabel = "ml"; } }
-      const rounded = Number.isInteger(amount) ? amount : Math.round(amount * 100) / 100;
-      parts.push(`${rounded}${unitLabel ? " " + unitLabel : ""}`);
-    }
-    if (item.texts.length) parts.push(item.texts.join(", "));
-    return parts.join(" + ") || "q.b.";
-  };
+  const shoppingRangeLabel = range.startDate ? `${formatShort(range.startDate)} a ${formatShort(range.endDate)}` : "";
 
   const buildShoppingShareText = () => {
-    const rangeLabel = range.startDate ? ` (${formatShort(range.startDate)} a ${formatShort(range.endDate)})` : "";
-    const lines = shoppingList.map((i) => `- ${i.name}: ${displayQty(i)}`);
-    return `🛒 Lista de compras${rangeLabel}\n\n${lines.join("\n")}`;
+    const blocks = shoppingSections.map((sec) => `${sec.title}\n${sec.items.map((i) => `- ${i.name}: ${i.qty}`).join("\n")}`);
+    return `🛒 Lista de compras${shoppingRangeLabel ? ` (${shoppingRangeLabel})` : ""}\n\n${blocks.join("\n\n")}`;
+  };
+
+  const exportShoppingPDF = () => {
+    const JsPDF = window.jspdf && window.jspdf.jsPDF;
+    if (!JsPDF) { alert("A biblioteca de PDF ainda não carregou. Espera uns segundos e tenta de novo (precisa de internet)."); return; }
+    const doc = new JsPDF({ unit: "mm", format: "a4" });
+    const W = 210, M = 20, BOTTOM = 280;
+    let y = 22;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(45, 90, 61);
+    doc.text("Lista de compras", W / 2, y, { align: "center" }); y += 7;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(120, 120, 120);
+    doc.text(`${shoppingRangeLabel}${shoppingRangeLabel ? " · " : ""}quantidades arredondadas (~ = estimativa)`, W / 2, y, { align: "center" }); y += 10;
+    shoppingSections.forEach((sec) => {
+      if (y + 20 > BOTTOM) { doc.addPage(); y = 22; }
+      doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(45, 90, 61);
+      doc.text(sec.title, M, y); y += 6;
+      sec.items.forEach((item) => {
+        if (y + 7 > BOTTOM) { doc.addPage(); y = 22; }
+        doc.setDrawColor(45, 90, 61); doc.setLineWidth(0.3); doc.rect(M, y - 3.6, 3.8, 3.8);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(10.5); doc.setTextColor(30, 30, 30);
+        doc.text(item.name, M + 7, y);
+        doc.setTextColor(70, 70, 70);
+        doc.text(item.qty, W - M, y, { align: "right" });
+        doc.setDrawColor(204, 204, 204); doc.setLineWidth(0.15); doc.line(M + 7, y + 2, W - M, y + 2);
+        y += 7;
+      });
+      y += 4;
+    });
+    doc.save(`lista-de-compras${range.startDate ? `_${range.startDate}_${range.endDate}` : ""}.pdf`);
   };
 
   const buildPlanShareText = () => {
@@ -441,6 +638,35 @@ function App() {
       return `— ${CATEGORY_META[c].label} —\n\n${list.map((r) => buildRecipeShareText(r)).join("\n\n")}`;
     }).filter(Boolean);
     return `📖 Livro de receitas\n\n${blocks.join("\n\n")}`;
+  };
+
+  // ---------- receita por fotografia ----------
+  const [photoState, setPhotoState] = useState({ status: "idle" });
+  const handlePhotoFiles = async (fileList) => {
+    const files = Array.from(fileList || []).slice(0, 4);
+    if (!files.length) return;
+    setPhotoState({ status: "loading" });
+    try {
+      const result = await parseRecipePhotos(files);
+      const ingredients = (result.ingredients || []).map((ing) => ({ id: uid(), name: ing.name || "", quantity: ing.quantity ?? "", unit: ing.unit || "" }));
+      if (!ingredients.length) throw new Error("Não encontrei ingredientes na fotografia. Tenta uma foto mais nítida, de frente e com boa luz.");
+      const rawCat = normalize(result.category).replace(/^acompanhamentos?$/, "acomp");
+      const name = result.name || "";
+      const category = CATEGORY_ORDER.includes(rawCat) ? rawCat : (guessCategory(name) || "carne");
+      setPhotoState({ status: "review", draft: { name, category, ingredients, prep: result.prep || "" } });
+    } catch (e) {
+      setPhotoState({ status: "error", message: String(e && e.message ? e.message : e) });
+    }
+  };
+  const updatePhotoDraft = (patch) => setPhotoState((s) => ({ ...s, draft: { ...s.draft, ...patch } }));
+  const savePhotoRecipe = () => {
+    const d = photoState.draft;
+    if (!d || !d.name.trim()) { alert("Dá um nome à receita antes de guardar."); return; }
+    const id = uid();
+    const recipe = { id, name: d.name.trim(), category: d.category || "carne", ingredients: d.ingredients.filter((i) => i.name.trim()), sourceUrl: "", prep: d.prep || "", createdAt: Date.now() };
+    setRecipes((r) => ({ ...r, [id]: recipe }));
+    upsertDish(recipe.name, recipe.category);
+    setPhotoState({ status: "idle" });
   };
 
   // ---------- livro de receitas ----------
@@ -679,10 +905,14 @@ function App() {
         .ing-unit { flex: 1; min-width: 0; }
         .spin { display: inline-block; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .share-row { display: flex; justify-content: flex-end; margin: 10px 0; }
+        .share-row { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
         .wa-btn, .icon-btn { text-decoration: none; }
         .wa-btn { display: flex; align-items: center; gap: 6px; background: var(--wa); color: #fff; border: none; border-radius: 8px; padding: 9px 14px; font-size: 13.5px; font-weight: 500; cursor: pointer; }
         .empty-state { text-align: center; padding: 30px 10px; color: var(--ink-soft); font-size: 13.5px; }
+        .shop-title { font-size: 17px; margin: 0 0 2px; color: var(--accent-dark); }
+        .shop-section { font-family: 'Fraunces', serif; font-weight: 600; font-size: 14.5px; color: var(--accent-dark); margin: 14px 0 2px; padding-bottom: 3px; border-bottom: 2px solid var(--accent); }
+        .pdf-btn, .photo-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 9px 14px; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; }
+        .photo-btn { width: 100%; }
         .shop-item { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
         .shop-item:last-child { border-bottom: none; }
         .shop-item.done { color: var(--ink-soft); text-decoration: line-through; }
@@ -767,19 +997,27 @@ function App() {
 
       {tab === "compras" && (
         <div>
-          {shoppingList.length === 0 && <div className="empty-state">Ainda não há ingredientes. Associa receitas aos pratos no separador Plano.</div>}
-          {shoppingList.length > 0 && (
+          {shoppingSections.length === 0 && <div className="empty-state">Ainda não há ingredientes. Associa receitas aos pratos no separador Plano.</div>}
+          {shoppingSections.length > 0 && (
             <>
               <div className="share-row">
                 <a className="wa-btn" href={`https://wa.me/?text=${encodeURIComponent(buildShoppingShareText())}`} target="_blank" rel="noopener noreferrer">💬 Partilhar lista</a>
+                <button className="pdf-btn" onClick={exportShoppingPDF}>📄 Descarregar PDF</button>
               </div>
               <div className="card">
-                {shoppingList.map((item) => (
-                  <label className={`shop-item ${checked[item.key] ? "done" : ""}`} key={item.key}>
-                    <input type="checkbox" checked={!!checked[item.key]} onChange={(e) => setChecked((c) => ({ ...c, [item.key]: e.target.checked }))} />
-                    {item.name}
-                    <span className="shop-qty">{displayQty(item)}</span>
-                  </label>
+                <h2 className="shop-title">Lista de compras</h2>
+                {shoppingRangeLabel && <p className="subtitle" style={{ margin: "0 0 4px" }}>{shoppingRangeLabel} · ~ = quantidade estimada</p>}
+                {shoppingSections.map((sec) => (
+                  <div key={sec.title}>
+                    <div className="shop-section">{sec.title}</div>
+                    {sec.items.map((item) => (
+                      <label className={`shop-item ${checked[item.key] ? "done" : ""}`} key={item.key}>
+                        <input type="checkbox" checked={!!checked[item.key]} onChange={(e) => setChecked((c) => ({ ...c, [item.key]: e.target.checked }))} />
+                        {item.name}
+                        <span className="shop-qty">{item.qty}</span>
+                      </label>
+                    ))}
+                  </div>
                 ))}
               </div>
             </>
@@ -791,6 +1029,35 @@ function App() {
         <div>
           <div className="card">
             <input className="filter-input" style={{ width: "100%" }} placeholder="Pesquisar receitas guardadas…" value={recipeFilter} onChange={(e) => setRecipeFilter(e.target.value)} />
+          </div>
+          <div className="card">
+            <label className="photo-btn">
+              📷 Adicionar receita por foto
+              <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => { handlePhotoFiles(e.target.files); e.target.value = ""; }} />
+            </label>
+            <p className="subtitle" style={{ margin: "6px 0 0" }}>Tira uma fotografia à receita (ou escolhe da galeria). Até 4 fotos, se tiver várias páginas.</p>
+            {photoState.status === "loading" && <p className="subtitle" style={{ marginTop: 8 }}>⏳ A ler a receita… pode demorar até 30 segundos.</p>}
+            {photoState.status === "error" && (
+              <div style={{ marginTop: 8 }}>
+                <p className="subtitle" style={{ color: "var(--danger)" }}>Não consegui ler a receita. {photoState.message}</p>
+                <button className="text-btn" onClick={() => setPhotoState({ status: "idle" })}>Fechar</button>
+              </div>
+            )}
+            {photoState.status === "review" && (
+              <div style={{ marginTop: 10 }}>
+                <p className="subtitle" style={{ margin: "0 0 6px" }}>Confirma o que a app leu e corrige se for preciso:</p>
+                <input className="slot-input" style={{ width: "100%", marginBottom: 6 }} placeholder="Nome da receita" value={photoState.draft.name} onChange={(e) => updatePhotoDraft({ name: e.target.value })} />
+                <select className="cat-select" style={{ marginBottom: 6 }} value={photoState.draft.category} onChange={(e) => updatePhotoDraft({ category: e.target.value })}>
+                  {CATEGORY_ORDER.map((c) => <option key={c} value={c}>{CATEGORY_META[c].label}</option>)}
+                </select>
+                <IngredientEditor ingredients={photoState.draft.ingredients} onChange={(ings) => updatePhotoDraft({ ingredients: ings })} />
+                <textarea className="prep-textarea" placeholder="Modo de preparação (opcional)" value={photoState.draft.prep || ""} onChange={(e) => updatePhotoDraft({ prep: e.target.value })} />
+                <div className="btn-row">
+                  <button className="text-btn primary" onClick={savePhotoRecipe}>✓ Guardar receita</button>
+                  <button className="text-btn" onClick={() => setPhotoState({ status: "idle" })}>Cancelar</button>
+                </div>
+              </div>
+            )}
           </div>
           {Object.keys(recipes).length > 0 && (
             <div className="share-row">
