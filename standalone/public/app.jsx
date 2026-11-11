@@ -229,6 +229,124 @@ function buildShoppingSections(rawIngredients) {
   }));
 }
 
+// ---------- exportar o livro de receitas (PDF e Word) ----------
+const recipeLine = (i) => `${i.name}${i.quantity ? `: ${i.quantity}${i.unit ? " " + i.unit : ""}` : ""}`;
+
+// O PDF usa letras padrão que não têm todos os símbolos: trocamos aspas/travessões e tiramos o que não existe
+const pdfSafe = (s) => String(s || "")
+  .replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, "-").replace(/\u2026/g, "...")
+  .replace(/[^\n\u0020-\u00FF]/g, "");
+
+function exportBookPDF(sections, title, fileName) {
+  const JsPDF = window.jspdf && window.jspdf.jsPDF;
+  if (!JsPDF) { alert("A biblioteca de PDF ainda não carregou. Espera uns segundos e tenta de novo (precisa de internet)."); return; }
+  const doc = new JsPDF({ unit: "mm", format: "a4" });
+  const W = 210, M = 20, BOTTOM = 282, TEXT_W = W - 2 * M;
+  let y = 24;
+  const ensure = (h) => { if (y + h > BOTTOM) { doc.addPage(); y = 22; } };
+  const writeLines = (text, size, lineH, color, indent = 0, style = "normal") => {
+    doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color);
+    pdfSafe(text).split("\n").forEach((para) => {
+      const lines = doc.splitTextToSize(para || " ", TEXT_W - indent);
+      lines.forEach((ln) => { ensure(lineH); doc.text(ln, M + indent, y); y += lineH; });
+    });
+  };
+  doc.setFont("helvetica", "bold"); doc.setFontSize(22); doc.setTextColor(45, 90, 61);
+  doc.text(pdfSafe(title), W / 2, y, { align: "center" }); y += 12;
+  sections.forEach((sec) => {
+    ensure(24);
+    y += 3;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(45, 90, 61);
+    doc.text(pdfSafe(sec.label), M, y); y += 2;
+    doc.setDrawColor(45, 90, 61); doc.setLineWidth(0.5); doc.line(M, y, W - M, y); y += 7;
+    sec.recipes.forEach((r) => {
+      ensure(30);
+      writeLines(r.name, 13, 6, [30, 30, 30], 0, "bold");
+      y += 1;
+      if (r.ingredients.length) {
+        writeLines("Ingredientes", 10, 5, [45, 90, 61], 0, "bold");
+        r.ingredients.forEach((i) => writeLines(`- ${recipeLine(i)}`, 10.5, 5, [50, 50, 50], 3));
+      }
+      if (r.prep) { y += 1.5; writeLines("Preparação", 10, 5, [45, 90, 61], 0, "bold"); writeLines(r.prep, 10.5, 5, [50, 50, 50]); }
+      if (r.sourceUrl) { y += 1; writeLines(`Fonte: ${r.sourceUrl}`, 8.5, 4.2, [120, 120, 120]); }
+      y += 7;
+    });
+  });
+  doc.save(fileName);
+}
+
+// --- Word (.docx) criado de raiz, sem bibliotecas externas ---
+const xmlEsc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+const docxPara = (text, o = {}) => {
+  const rPr = `<w:rPr>${o.bold ? "<w:b/>" : ""}${o.color ? `<w:color w:val="${o.color}"/>` : ""}<w:sz w:val="${o.size || 22}"/></w:rPr>`;
+  const pPr = `<w:pPr>${o.keepNext ? "<w:keepNext/>" : ""}${o.border ? '<w:pBdr><w:bottom w:val="single" w:sz="8" w:space="2" w:color="2D5A3D"/></w:pBdr>' : ""}<w:spacing w:before="${o.before || 0}" w:after="${o.after === undefined ? 60 : o.after}"/>${o.indent ? `<w:ind w:left="${o.indent}" w:hanging="${o.hanging || 0}"/>` : ""}${o.center ? '<w:jc w:val="center"/>' : ""}</w:pPr>`;
+  return `<w:p>${pPr}<w:r>${rPr}<w:t xml:space="preserve">${xmlEsc(text)}</w:t></w:r></w:p>`;
+};
+
+const CRC_TABLE = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = (bytes) => { let c = 0xFFFFFFFF; for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+// Cria um ficheiro .zip simples (sem compressão), que é o que um .docx é por dentro
+function makeZip(files) {
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  files.forEach(({ name, content }) => {
+    const nameB = enc.encode(name), data = enc.encode(content), crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true); local.setUint16(6, 0x0800, true); local.setUint16(8, 0, true);
+    local.setUint16(10, 0, true); local.setUint16(12, 0x5821, true); local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true); local.setUint32(22, data.length, true); local.setUint16(26, nameB.length, true); local.setUint16(28, 0, true);
+    parts.push(new Uint8Array(local.buffer), nameB, data);
+    const cen = new DataView(new ArrayBuffer(46));
+    cen.setUint32(0, 0x02014b50, true); cen.setUint16(4, 20, true); cen.setUint16(6, 20, true); cen.setUint16(8, 0x0800, true); cen.setUint16(10, 0, true);
+    cen.setUint16(12, 0, true); cen.setUint16(14, 0x5821, true); cen.setUint32(16, crc, true);
+    cen.setUint32(20, data.length, true); cen.setUint32(24, data.length, true); cen.setUint16(28, nameB.length, true);
+    cen.setUint32(42, offset, true);
+    central.push(new Uint8Array(cen.buffer), nameB);
+    offset += 30 + nameB.length + data.length;
+  });
+  const centralSize = central.reduce((n, a) => n + a.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+}
+
+function buildDocxBlob(sections, title) {
+  const body = [docxPara(title, { bold: true, size: 44, color: "2D5A3D", center: true, after: 240 })];
+  sections.forEach((sec) => {
+    body.push(docxPara(sec.label, { bold: true, size: 30, color: "2D5A3D", before: 300, after: 160, border: true, keepNext: true }));
+    sec.recipes.forEach((r) => {
+      body.push(docxPara(r.name, { bold: true, size: 26, before: 200, after: 80, keepNext: true }));
+      if (r.ingredients.length) {
+        body.push(docxPara("Ingredientes", { bold: true, size: 21, color: "2D5A3D", after: 40, keepNext: true }));
+        r.ingredients.forEach((i) => body.push(docxPara(`•  ${recipeLine(i)}`, { size: 22, indent: 360, hanging: 240, after: 20 })));
+      }
+      if (r.prep) {
+        body.push(docxPara("Preparação", { bold: true, size: 21, color: "2D5A3D", before: 100, after: 40, keepNext: true }));
+        String(r.prep).split("\n").forEach((line) => body.push(docxPara(line, { size: 22, after: 60 })));
+      }
+      if (r.sourceUrl) body.push(docxPara(`Fonte: ${r.sourceUrl}`, { size: 17, color: "777777", before: 40 }));
+    });
+  });
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body.join("")}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  return makeZip([
+    { name: "[Content_Types].xml", content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>` },
+    { name: "_rels/.rels", content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>` },
+    { name: "word/document.xml", content: documentXml },
+  ]);
+}
+
+function exportBookDocx(sections, title, fileName) {
+  const blob = buildDocxBlob(sections, title);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = fileName;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 // ---------- chamadas à API ----------
 async function readJsonFromApi(response) {
   if (!response.ok) {
@@ -630,6 +748,18 @@ function App() {
     return `🍲 ${recipe.name}\n\nIngredientes:\n${lines.join("\n")}${recipe.prep ? `\n\nPreparação: ${recipe.prep}` : ""}${recipe.sourceUrl ? `\n\nFonte: ${recipe.sourceUrl}` : ""}`;
   };
 
+  const getBookSections = (onlyCategory) => (onlyCategory ? [onlyCategory] : CATEGORY_ORDER)
+    .map((c) => ({ label: CATEGORY_META[c].label, recipes: recipesByCategory[c] || [] }))
+    .filter((sec) => sec.recipes.length);
+  const exportBook = (kind, onlyCategory) => {
+    const sections = getBookSections(onlyCategory);
+    if (!sections.length) { alert("Ainda não há receitas para exportar."); return; }
+    const title = onlyCategory ? `Livro de receitas - ${CATEGORY_META[onlyCategory].label}` : "Livro de receitas";
+    const base = onlyCategory ? `livro-de-receitas_${onlyCategory}` : "livro-de-receitas";
+    if (kind === "pdf") exportBookPDF(sections, title, `${base}.pdf`);
+    else exportBookDocx(sections, title, `${base}.docx`);
+  };
+
   const buildRecipeBookShareText = (onlyCategory) => {
     const cats = onlyCategory ? [onlyCategory] : CATEGORY_ORDER;
     const blocks = cats.map((c) => {
@@ -894,7 +1024,7 @@ function App() {
         .draft-title { font-family: 'Fraunces', serif; font-size: 15px; font-weight: 600; }
         .draft-prep { color: var(--ink-soft); font-size: 12.5px; }
         .draft-name-input { width: 100%; margin-bottom: 6px; font-family: 'Fraunces', serif; font-size: 15px; font-weight: 600; }
-        .prep-textarea { width: 100%; min-height: 52px; font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 7px; background: #FBFAF6; color: var(--ink); resize: vertical; margin-top: 6px; }
+        .prep-textarea { width: 100%; min-height: 170px; line-height: 1.45; font-family: 'IBM Plex Sans', sans-serif; font-size: 13px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 7px; background: #FBFAF6; color: var(--ink); resize: vertical; margin-top: 6px; }
         .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
         .text-btn { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; color: var(--accent-dark); font-size: 13px; font-weight: 500; cursor: pointer; padding: 4px 0; }
         .text-btn.primary { background: var(--accent); color: #fff; padding: 7px 10px; border-radius: 6px; }
@@ -1062,6 +1192,8 @@ function App() {
           {Object.keys(recipes).length > 0 && (
             <div className="share-row">
               <a className="wa-btn" href={`https://wa.me/?text=${encodeURIComponent(buildRecipeBookShareText())}`} target="_blank" rel="noopener noreferrer">💬 Partilhar livro completo</a>
+              <button className="pdf-btn" onClick={() => exportBook("pdf")}>📄 PDF</button>
+              <button className="pdf-btn" onClick={() => exportBook("docx")}>📝 Word</button>
             </div>
           )}
           {CATEGORY_ORDER.map((cat) => (
@@ -1070,6 +1202,12 @@ function App() {
                 <span className="cat-dot" style={{ background: CATEGORY_META[cat].color }} />{CATEGORY_META[cat].label} <span className="recipe-count">({recipesByCategory[cat].length})</span>
                 {recipesByCategory[cat].length > 0 && (
                   <a className="icon-btn ghost" style={{ marginLeft: "auto" }} href={`https://wa.me/?text=${encodeURIComponent(buildRecipeBookShareText(cat))}`} target="_blank" rel="noopener noreferrer" aria-label="Partilhar categoria">💬</a>
+                )}
+                {recipesByCategory[cat].length > 0 && (
+                  <>
+                    <button className="icon-btn ghost" onClick={() => exportBook("pdf", cat)} aria-label="Exportar categoria em PDF" title="PDF">📄</button>
+                    <button className="icon-btn ghost" onClick={() => exportBook("docx", cat)} aria-label="Exportar categoria em Word" title="Word">📝</button>
+                  </>
                 )}
               </div>
               {recipesByCategory[cat].length === 0 && <p className="subtitle" style={{ margin: "0 0 8px" }}>Sem receitas guardadas ainda.</p>}
